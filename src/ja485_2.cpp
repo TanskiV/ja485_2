@@ -1,4 +1,5 @@
 #include "Particle.h"
+#include <HttpClient.h>
 
 // This firmware provides a minimal implementation of the standard
 // controller functions requested for all Shefa Green controllers. The
@@ -81,10 +82,20 @@ Mutex sendMutex;
 // Configuration for the remote server endpoint. In a real deployment these
 // values would be provided by product settings or compile-time definitions.
 // They are kept here as simple constants for clarity in this template.
-const char *SERVER_HOST   = "example.com";  // server base host
-const int   SERVER_PORT   = 80;             // server port
+const char *SERVER_HOST   = "shefa.green";      // server base host
+const int   SERVER_PORT   = 443;                // https port
 const char *SERVER_PATH   = "/api/sensor-data";
-const char *SENSOR_SECRET = "changeme";     // authentication secret
+const char *SENSOR_SECRET = "changeme";         // authentication secret
+
+// HttpClient setup
+HttpClient http;
+http_request_t request;
+http_response_t response;
+http_header_t headers[] = {
+    { "Content-Type", "application/json" },
+    { "x-sensor-secret", SENSOR_SECRET },
+    { NULL, NULL }
+};
 
 // Last time sensor data was pushed to the server
 time_t lastServerPush = 0;
@@ -129,37 +140,26 @@ void savePersistent() {
 
 // Serialize the readings and send them to the configured server. The function
 // returns true on HTTP 2xx responses and provides the status code through
-// `httpStatus`.
-bool sendReadingsToServer(const ReadingPayload &r, int &httpStatus) {
+// `httpStatus`. A short event is published indicating the result.
+bool sendToServer(const ReadingPayload &r, int &httpStatus, const char *source) {
+    request.hostname = SERVER_HOST;
+    request.port = SERVER_PORT;
+    request.path = SERVER_PATH;
+
     // Build JSON body
     String body = String::format(
-        "{\"deviceId\":\"%s\",\"firmwareVersion\":\"%s\",\"timestamp\":%lu,\"dummy_value\":%.2f}",
-        r.device_id.c_str(), r.firmware_version.c_str(), (unsigned long)r.unix_ts, r.dummy_value);
+        "{\"deviceId\":\"%s\",\"firmwareVersion\":\"%s\",\"timestamp\":%lu,\"serverInterval\":%.2f,\"displayInterval\":%.2f,\"dummy_value\":%.2f}",
+        r.device_id.c_str(), r.firmware_version.c_str(), (unsigned long)r.unix_ts,
+        r.server_interval, r.display_interval, r.dummy_value);
 
-    TCPClient client;
-    if (!client.connect(SERVER_HOST, SERVER_PORT)) {
-        httpStatus = 0;
-        return false;
-    }
+    request.body = body;
 
-    String request = String::format(
-        "POST %s HTTP/1.1\r\nHost: %s\r\nContent-Type: application/json\r\nx-sensor-secret: %s\r\nContent-Length: %d\r\n\r\n%s",
-        SERVER_PATH, SERVER_HOST, SENSOR_SECRET, body.length(), body.c_str());
-    client.print(request);
+    http.post(request, response, headers);
+    httpStatus = response.status;
 
-    // Wait for response
-    unsigned long start = millis();
-    while (client.connected() && !client.available() && millis() - start < 5000) {
-        Particle.process();
-    }
-    String statusLine = client.readStringUntil('\n');
-    if (statusLine.startsWith("HTTP/1.1 ")) {
-        httpStatus = statusLine.substring(9, 12).toInt();
-    } else {
-        httpStatus = 0;
-    }
-    client.stop();
-    return httpStatus >= 200 && httpStatus < 300;
+    bool ok = httpStatus >= 200 && httpStatus < 300;
+    Particle.publish("sensor/push", String::format("%s_%s:%d", source, ok ? "ok" : "error", httpStatus), PRIVATE);
+    return ok;
 }
 
 // ----- API function implementations -----------------------------------------
@@ -249,20 +249,18 @@ ActionResult PushNow() {
     sendMutex.lock();
     ReadingPayload reading = GetReadings();
     int httpStatus = 0;
-    bool success = sendReadingsToServer(reading, httpStatus);
+    bool success = sendToServer(reading, httpStatus, "manual");
     if (success) {
         sendSuccessCount++;
         res.status = "ok";
         res.http_status = httpStatus;
         Log.info("PushNow succeeded (%d)", httpStatus);
-        Particle.publish("sensor/push", "manual_ok", PRIVATE);
     } else {
         sendFailCount++;
         res.status = "error";
         res.http_status = httpStatus;
         res.error_reason = "send_failed";
         Log.error("PushNow failed (%d)", httpStatus);
-        Particle.publish("sensor/push", "manual_error", PRIVATE);
     }
     sendMutex.unlock();
 
@@ -284,15 +282,13 @@ void loop() {
         sendMutex.lock();
         ReadingPayload reading = GetReadings();
         int httpStatus = 0;
-        bool success = sendReadingsToServer(reading, httpStatus);
+        bool success = sendToServer(reading, httpStatus, "scheduled");
         if (success) {
             sendSuccessCount++;
             Log.info("Scheduled push succeeded (%d)", httpStatus);
-            Particle.publish("sensor/push", "scheduled_ok", PRIVATE);
         } else {
             sendFailCount++;
             Log.error("Scheduled push failed (%d)", httpStatus);
-            Particle.publish("sensor/push", "scheduled_error", PRIVATE);
         }
         sendMutex.unlock();
     }

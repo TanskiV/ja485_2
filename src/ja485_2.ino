@@ -115,6 +115,11 @@ bool readRegister(uint16_t reg, float &value, float scale) {
 
 // Cloud function to get sensor readings immediately
 int getReadings(String command) {
+    readECController();
+    delay(300);
+    readPHController();
+    delay(300);
+    readORPController();
     publishReadings();
     return 1;
 }
@@ -122,10 +127,11 @@ int getReadings(String command) {
 // Function to publish readings to the Particle Cloud
 void publishReadings() {
     String response = String::format(
-        "{\"EC_Temperature\": %.1f, \"EC\": %.3f, \"pH\": %.2f, \"ORP\": %.1f}",
+        "{\\\"deviceId\\\":\\\"%s\\\",\\\"timestamp\\\":%lu,\\\"firmware\\\":\\\"%s\\\",\\\"EC_Temperature\\\":%.1f,\\\"EC\\\":%.3f,\\\"pH\\\":%.2f,\\\"ORP\\\":%.1f}",
+        System.deviceID().c_str(), Time.now(), System.version().c_str(),
         ecTempValue, ecValue, phValue, orpValue
     );
-    Particle.publish("SensorReadings", response, PRIVATE);
+    Particle.publish("sensor/readings", response, PRIVATE);
     Serial.println("[Cloud Publish] " + response);
 }
 

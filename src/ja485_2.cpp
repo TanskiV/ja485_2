@@ -78,6 +78,17 @@ uint32_t sampleCounter = 0;
 // not implemented but the mutex is kept to show how concurrency is handled.
 Mutex sendMutex;
 
+// Configuration for the remote server endpoint. In a real deployment these
+// values would be provided by product settings or compile-time definitions.
+// They are kept here as simple constants for clarity in this template.
+const char *SERVER_HOST   = "example.com";  // server base host
+const int   SERVER_PORT   = 80;             // server port
+const char *SERVER_PATH   = "/api/sensor-data";
+const char *SENSOR_SECRET = "changeme";     // authentication secret
+
+// Last time sensor data was pushed to the server
+time_t lastServerPush = 0;
+
 // ----- Utility functions ------------------------------------------------------
 
 String iso8601FromTime(time_t ts) {
@@ -114,6 +125,41 @@ void savePersistent() {
     persistent.display_interval = displayIntervalCfg.current_value;
     persistent.server_interval  = serverIntervalCfg.current_value;
     EEPROM.put(EEPROM_ADDR, persistent);
+}
+
+// Serialize the readings and send them to the configured server. The function
+// returns true on HTTP 2xx responses and provides the status code through
+// `httpStatus`.
+bool sendReadingsToServer(const ReadingPayload &r, int &httpStatus) {
+    // Build JSON body
+    String body = String::format(
+        "{\"deviceId\":\"%s\",\"firmwareVersion\":\"%s\",\"timestamp\":%lu,\"dummy_value\":%.2f}",
+        r.device_id.c_str(), r.firmware_version.c_str(), (unsigned long)r.unix_ts, r.dummy_value);
+
+    TCPClient client;
+    if (!client.connect(SERVER_HOST, SERVER_PORT)) {
+        httpStatus = 0;
+        return false;
+    }
+
+    String request = String::format(
+        "POST %s HTTP/1.1\r\nHost: %s\r\nContent-Type: application/json\r\nx-sensor-secret: %s\r\nContent-Length: %d\r\n\r\n%s",
+        SERVER_PATH, SERVER_HOST, SENSOR_SECRET, body.length(), body.c_str());
+    client.print(request);
+
+    // Wait for response
+    unsigned long start = millis();
+    while (client.connected() && !client.available() && millis() - start < 5000) {
+        Particle.process();
+    }
+    String statusLine = client.readStringUntil('\n');
+    if (statusLine.startsWith("HTTP/1.1 ")) {
+        httpStatus = statusLine.substring(9, 12).toInt();
+    } else {
+        httpStatus = 0;
+    }
+    client.stop();
+    return httpStatus >= 200 && httpStatus < 300;
 }
 
 // ----- API function implementations -----------------------------------------
@@ -201,19 +247,22 @@ ActionResult PushNow() {
     ActionResult res;
 
     sendMutex.lock();
-    // In a real implementation, the readings would be formatted and sent using
-    // the configured endpoint and authentication headers. For this template we
-    // simply pretend the send succeeded.
-    bool success = true; // replace with actual HTTP send
+    ReadingPayload reading = GetReadings();
+    int httpStatus = 0;
+    bool success = sendReadingsToServer(reading, httpStatus);
     if (success) {
         sendSuccessCount++;
         res.status = "ok";
-        res.http_status = 200;
+        res.http_status = httpStatus;
+        Log.info("PushNow succeeded (%d)", httpStatus);
+        Particle.publish("sensor/push", "manual_ok", PRIVATE);
     } else {
         sendFailCount++;
         res.status = "error";
-        res.http_status = 0;
+        res.http_status = httpStatus;
         res.error_reason = "send_failed";
+        Log.error("PushNow failed (%d)", httpStatus);
+        Particle.publish("sensor/push", "manual_error", PRIVATE);
     }
     sendMutex.unlock();
 
@@ -229,8 +278,23 @@ void setup() {
 }
 
 void loop() {
-    // Placeholder for the main application loop. The controller's regular
-    // periodic behaviour (reading sensors and sending to the server) would be
-    // implemented here using the configured intervals.
+    time_t now = Time.now();
+    if (now - lastServerPush >= (time_t)(serverIntervalCfg.current_value * 60)) {
+        lastServerPush = now;
+        sendMutex.lock();
+        ReadingPayload reading = GetReadings();
+        int httpStatus = 0;
+        bool success = sendReadingsToServer(reading, httpStatus);
+        if (success) {
+            sendSuccessCount++;
+            Log.info("Scheduled push succeeded (%d)", httpStatus);
+            Particle.publish("sensor/push", "scheduled_ok", PRIVATE);
+        } else {
+            sendFailCount++;
+            Log.error("Scheduled push failed (%d)", httpStatus);
+            Particle.publish("sensor/push", "scheduled_error", PRIVATE);
+        }
+        sendMutex.unlock();
+    }
 }
 
